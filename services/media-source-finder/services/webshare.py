@@ -100,53 +100,49 @@ def _parse_search_results(xml_text: str) -> list[dict]:
             size = int(size_text)
         except ValueError:
             size = 0
+        try:
+            positive_votes = int(file_el.findtext("positive_votes") or "0")
+            negative_votes = int(file_el.findtext("negative_votes") or "0")
+        except ValueError:
+            positive_votes = 0
+            negative_votes = 0
         if ident and name:
-            results.append({"ident": ident, "name": name, "size": size})
+            results.append({
+                "ident": ident,
+                "name": name,
+                "size": size,
+                "positive_votes": positive_votes,
+                "negative_votes": negative_votes,
+            })
     return results
+
+
+async def _do_search(wst: str, query: str, limit: int) -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{WEBSHARE_BASE}/search/",
+            data={"what": query, "category": "video", "limit": str(limit), "wst": wst},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        resp.raise_for_status()
+    return resp.text
 
 
 async def search_videos(query: str, limit: int = 20) -> list[dict]:
     global _wst
     wst = await _ensure_authenticated()
+    xml_text = await _do_search(wst, query, limit)
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{WEBSHARE_BASE}/search/",
-            data={
-                "what": query,
-                "category": "video",
-                "limit": str(limit),
-                "wst": wst,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        resp.raise_for_status()
-
-    # Handle auth failure
-    status = _parse_xml_status(resp.text)
-    if status == "FATAL":
+    if _parse_xml_status(xml_text) == "FATAL":
         _wst = None
         wst = await _ensure_authenticated()
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{WEBSHARE_BASE}/search/",
-                data={
-                    "what": query,
-                    "category": "video",
-                    "limit": str(limit),
-                    "wst": wst,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            resp.raise_for_status()
+        xml_text = await _do_search(wst, query, limit)
 
-    return _parse_search_results(resp.text)
+    return _parse_search_results(xml_text)
 
 
 async def get_file_link(ident: str) -> str:
-    global _wst
     wst = await _ensure_authenticated()
-
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{WEBSHARE_BASE}/file_link/",
@@ -154,8 +150,55 @@ async def get_file_link(ident: str) -> str:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         resp.raise_for_status()
-
     link = _parse_xml_text(resp.text, "link")
     if not link:
         raise RuntimeError(f"No link in file_link response for ident={ident}: {resp.text}")
     return link
+
+
+async def get_file_info(ident: str) -> dict:
+    wst = await _ensure_authenticated()
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{WEBSHARE_BASE}/file_info/",
+            data={"ident": ident, "wst": wst},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        resp.raise_for_status()
+
+    root = ET.fromstring(resp.text)
+
+    def _int(tag: str) -> Optional[int]:
+        v = root.findtext(tag)
+        try:
+            return int(v) if v else None
+        except ValueError:
+            return None
+
+    def _float(tag: str) -> Optional[float]:
+        v = root.findtext(tag)
+        try:
+            return float(v) if v else None
+        except ValueError:
+            return None
+
+    audio_tracks = []
+    for s in root.findall(".//audio/stream"):
+        ch = s.findtext("channels")
+        br = s.findtext("bitrate")
+        audio_tracks.append({
+            "format": s.findtext("format"),
+            "channels": int(ch) if ch else None,
+            "language": s.findtext("language"),
+        })
+
+    bitrate = _int("bitrate")
+    return {
+        "video_codec": root.findtext("format"),
+        "width": _int("width"),
+        "height": _int("height"),
+        "fps": _float("fps"),
+        "bitrate_kbps": bitrate // 1000 if bitrate else None,
+        "duration_seconds": _int("length"),
+        "audio_tracks": audio_tracks,
+    }
