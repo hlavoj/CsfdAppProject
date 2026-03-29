@@ -9,11 +9,17 @@ import re
 import httpx
 from models.media_source import MovieInfo
 
+_SXEX_RE = re.compile(r's\d{1,2}e\d{1,2}')
+
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 MODEL = "meta-llama/llama-3.1-8b-instruct"
 
 # Max candidates sent to AI — pre-filter reduces noise and token count
 AI_CANDIDATE_LIMIT = 15
+
+
+def _sxex(season: int, episode: int) -> str:
+    return f"s{season:02d}e{episode:02d}"
 
 
 def _prefilter(candidates: list[dict], movie: MovieInfo) -> list[dict]:
@@ -24,6 +30,7 @@ def _prefilter(candidates: list[dict], movie: MovieInfo) -> list[dict]:
     title_cz = movie.title.lower()
     title_en = movie.original_title.lower()
     year = movie.year
+    is_series = movie.media_type == "series"
 
     def score(c: dict) -> int:
         name = c["name"].lower()
@@ -35,6 +42,20 @@ def _prefilter(candidates: list[dict], movie: MovieInfo) -> list[dict]:
         if "dabing" in name or "dab." in name:                s += 2
         if "1080" in name:                                    s += 1
         if "2160" in name or "4k" in name:                    s += 1
+        # Series: exact SxxExx match is highest-value signal
+        if is_series and movie.season is not None and movie.episode is not None:
+            sxex = _sxex(movie.season, movie.episode)
+            alt = f"s{movie.season}e{movie.episode}"
+            if sxex in name:                                  s += 10
+            elif alt in name:                                 s += 8
+            found = _SXEX_RE.findall(name)
+            if found:
+                # File has SxxExx — penalize if it's a different episode
+                if sxex not in found and alt not in found:
+                    s -= 20  # wrong episode — hard exclude
+            else:
+                # No episode notation — slight penalty (prefer explicit matches)
+                s -= 5
         s += c.get("positive_votes", 0)
         s -= c.get("negative_votes", 0) * 2
         return s
@@ -49,11 +70,31 @@ def _build_prompt(movie: MovieInfo, candidates: list[dict], limit: int) -> str:
         ensure_ascii=False,
     )
     runtime_line = f", {movie.runtime_minutes} min" if movie.runtime_minutes else ""
+
+    if movie.media_type == "series" and movie.season is not None:
+        sxex = f"S{movie.season:02d}E{movie.episode:02d}"
+        ep_title = f" — {movie.episode_title}" if movie.episode_title else ""
+        target = (
+            f"{movie.title} / {movie.original_title} "
+            f"{sxex}{ep_title} ({movie.year}{runtime_line})"
+        )
+        hints = (
+            f"This is a TV series episode {sxex}. "
+            f"SxxExx match is the most critical signal — wrong episode = 0%. "
+            f"Czech dubbing preferred, subtitles acceptable. "
+            f"'CZ dabing'=dubbed, '&' becomes 'a' in Czech titles, diacritics often stripped. "
+            f"Quality: 2160p>1080p>720p. votes=community trust."
+        )
+    else:
+        target = f"{movie.title} / {movie.original_title} ({movie.year}{runtime_line})"
+        hints = (
+            f"Czech dubbing preferred, subtitles acceptable. "
+            f"'CZ dabing'=dubbed, '&' becomes 'a' in Czech titles, diacritics often stripped. "
+            f"Quality: 2160p>1080p>720p. votes=community trust."
+        )
+
     return (
-        f"Rank these Webshare video files for: {movie.title} / {movie.original_title} "
-        f"({movie.year}{runtime_line}). Czech dubbing preferred, subtitles acceptable. "
-        f"Hints: 'CZ dabing'=dubbed, '&' becomes 'a' in Czech titles, diacritics often stripped. "
-        f"Quality: 2160p>1080p>720p. votes=community trust.\n"
+        f"Rank these Webshare video files for: {target}. {hints}\n"
         f"Files: {candidates_json}\n"
         f"Return JSON array of top {limit} sorted best-first: "
         f'[{{"ident":"...","match_probability":85,"reasoning":"short"}}]. '
@@ -95,9 +136,14 @@ async def rank_results(movie: MovieInfo, candidates: list[dict], limit: int) -> 
     text = resp.json()["choices"][0]["message"]["content"]
     ranked: list[dict] = _parse_response(text)
 
-    # If model returned a wrapped object instead of array, unwrap it
+    # Normalize: model sometimes returns a single dict or wrapped object instead of an array
     if isinstance(ranked, dict):
-        ranked = next((v for v in ranked.values() if isinstance(v, list)), [])
+        if "ident" in ranked:
+            # Single item returned as object {"ident":"...","match_probability":85}
+            ranked = [ranked]
+        else:
+            # Wrapped array {"results":[...]} or {"files":[...]}
+            ranked = next((v for v in ranked.values() if isinstance(v, list)), [])
 
     # Guard against hallucinated idents
     valid_idents = {c["ident"] for c in filtered}

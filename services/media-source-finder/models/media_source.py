@@ -10,6 +10,11 @@ class MovieInfo(BaseModel):
     source: str                         # "omdb" | "tmdb"
     runtime_minutes: Optional[int] = None
     genres: list[str] = []
+    # Series/episode fields (only set for series)
+    media_type: str = "movie"           # "movie" | "series"
+    season: Optional[int] = None
+    episode: Optional[int] = None
+    episode_title: Optional[str] = None
 
 
 class AudioTrack(BaseModel):

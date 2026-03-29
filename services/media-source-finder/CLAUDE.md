@@ -50,20 +50,29 @@ Avoid port 8000 on Windows — it is commonly reserved by the OS.
 
 ### `GET /search`
 
-| Parameter  | Type   | Required | Description                          |
-|------------|--------|----------|--------------------------------------|
-| `imdb_id`  | string | one of   | IMDB ID, e.g. `tt1375666`            |
-| `tmdb_id`  | string | one of   | TMDB ID, e.g. `27205`                |
-| `csfd_id`  | string | one of   | CSFD ID — returns **501** for now    |
-| `limit`    | int    | no       | Results to return, default `5`, max `20` |
+| Parameter  | Type   | Required | Description                                        |
+|------------|--------|----------|----------------------------------------------------|
+| `imdb_id`  | string | one of   | IMDB ID, e.g. `tt1375666`                          |
+| `tmdb_id`  | string | one of   | TMDB ID (movie or TV show), e.g. `27205`           |
+| `csfd_id`  | string | one of   | CSFD ID — returns **501** for now                  |
+| `season`   | int    | no       | Season number — required for series with `tmdb_id` |
+| `episode`  | int    | no       | Episode number — required for series with `tmdb_id`|
+| `limit`    | int    | no       | Results to return, default `5`, max `20`           |
 
 Exactly one of `imdb_id`, `tmdb_id`, `csfd_id` must be provided.
+
+For TV series pass `tmdb_id` (TV show ID) + `season` + `episode`.
 
 #### Examples
 
 ```bash
+# Movies
 curl "http://localhost:8080/search?tmdb_id=27205&limit=3"
 curl "http://localhost:8080/search?imdb_id=tt1375666&limit=5"
+
+# TV Series episodes
+curl "http://localhost:8080/search?tmdb_id=1396&season=1&episode=1&limit=3"   # Breaking Bad S01E01
+curl "http://localhost:8080/search?tmdb_id=60574&season=2&episode=1&limit=3"  # Peaky Blinders S02E01
 ```
 
 #### Response
@@ -110,18 +119,22 @@ curl "http://localhost:8080/search?imdb_id=tt1375666&limit=5"
 ## Service Flow
 
 1. **Validate** — exactly one of `imdb_id` / `tmdb_id` / `csfd_id`
-2. **Movie metadata**
+2. **Movie/episode metadata**
    - `imdb_id` → `omdb.py` → OMDB API → English title + year
-   - `tmdb_id` → `tmdb.py` → TMDB API (`language=cs`) → Czech title, original title, year, runtime, genres
+   - `tmdb_id` (movie) → `tmdb.py` `get_movie_info()` → Czech title, original title, year, runtime, genres
+   - `tmdb_id` + `season` + `episode` → `tmdb.py` `get_series_info()` → TV show + episode metadata
 3. **Webshare auth** (`webshare.py`) — WST token cached in memory, re-auth on FATAL response
    - `POST /api/salt/` → SHA1(md5crypt(password, salt)) → `POST /api/login/` → `<token>`
 4. **Dual parallel search** — two simultaneous `POST /api/search/` calls:
-   - `"{czech_title} {year} CZ"` → 20 results
-   - `"{original_title} {year} CZ"` → 20 results
+   - Movies: `"{czech_title} {year} CZ"` + `"{original_title} {year} CZ"`
+   - Series: `"{show_title_cz} S{s:02d}E{e:02d} CZ"` + `"{show_title_en} S{s:02d}E{e:02d}"`
 5. **Dedup + filter** — deduplicate by `ident`, drop non-video extensions → max 40 candidates
-6. **Pre-filter** (`gemini.py`) — heuristic scoring (title match, year, CZ label, quality, votes) → top 15
+6. **Pre-filter** (`gemini.py`) — heuristic scoring → top 15:
+   - Movies: title_en(+6), title_cz(+4), year(+3), CZ label(+3), dabing(+2), quality(+1)
+   - Series: adds SxxExx exact match(+10), wrong episode penalty(-20), no-episode-notation(-5)
 7. **AI ranking** (`gemini.py`) — OpenRouter `llama-3.1-8b-instruct` with `json_object` response mode
-   - Returns all 15 ranked with `match_probability` (0–100) and `reasoning`
+   - Returns top N ranked with `match_probability` (0–100) and `reasoning`
+   - Series prompt emphasizes SxxExx as the most critical matching signal
 8. **Parallel fetch** — for top N results only: `POST /api/file_link/` + `POST /api/file_info/` in parallel
 9. **Return** assembled `SearchResponse`
 
