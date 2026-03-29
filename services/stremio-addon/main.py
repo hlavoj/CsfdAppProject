@@ -87,4 +87,7 @@ def stream_redirect(ident: str):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=7000, debug=False)
+    import os
+    host = os.getenv("FLASK_HOST", "127.0.0.1")
+    port = int(os.getenv("FLASK_PORT", "7000"))
+    app.run(host=host, port=port, debug=False)

@@ -1,0 +1,26 @@
+services:
+  media-source-finder:
+    build: ./services/media-source-finder
+    restart: unless-stopped
+    environment:
+      - WEBSHARE_USERNAME=${WEBSHARE_USERNAME}
+      - WEBSHARE_PASSWORD=${WEBSHARE_PASSWORD}
+      - OMDB_API_KEY=${OMDB_API_KEY}
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+
+  stremio-addon:
+    build: ./services/stremio-addon
+    restart: unless-stopped
+    environment:
+      - MEDIA_FINDER_URL=http://media-source-finder:8080
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      - ADDON_URL=${ADDON_URL}
+      - FLASK_HOST=0.0.0.0
+      - FLASK_PORT=7000
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.stremio.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.stremio.entrypoints=websecure"
+      - "traefik.http.routers.stremio.tls.certresolver=letsencrypt"
+      - "traefik.http.services.stremio.loadbalancer.server.port=7000"
