@@ -1,7 +1,8 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from flask import Flask, jsonify, redirect, abort, request
+from flask import Flask, jsonify, abort, request, Response
+import requests as req_lib
 from services.cache import TTLCache
 from services.tmdb import get_tmdb_id, get_tmdb_tv_id
 from services.media_finder import search_streams, get_file_link
@@ -12,7 +13,7 @@ _cache: TTLCache = TTLCache(ttl_seconds=600)
 
 MANIFEST = {
     "id": "com.csfdapp.mediasourcefinder",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "name": "MediaSource CZ",
     "description": "Czech streams from Webshare.cz, AI-ranked",
     "types": ["movie", "series"],
@@ -78,12 +79,39 @@ def stream(content_type: str, video_id: str):
     return jsonify({"streams": streams, "cacheMaxAge": 600})
 
 
-@app.route("/stream-redirect/<ident>")
-def stream_redirect(ident: str):
+@app.route("/stream-proxy/<ident>")
+def stream_proxy(ident: str):
+    """
+    Proxy video bytes from Webshare CDN through this server.
+    - Fixes IP-restricted Webshare URLs (CDN URL is always fetched by VPS IP)
+    - Upgrades HTTP Webshare streams to HTTPS for web browsers
+    - Supports Range requests so seeking works
+    """
     url = get_file_link(ident)
     if not url:
         abort(404)
-    return redirect(url, 302)
+
+    # Forward Range header from player (needed for seeking)
+    headers = {}
+    if "Range" in request.headers:
+        headers["Range"] = request.headers["Range"]
+
+    upstream = req_lib.get(url, headers=headers, stream=True, timeout=10)
+
+    response_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": upstream.headers.get("Content-Type", "video/x-matroska"),
+    }
+    for h in ("Content-Length", "Content-Range"):
+        if h in upstream.headers:
+            response_headers[h] = upstream.headers[h]
+
+    def generate():
+        for chunk in upstream.iter_content(chunk_size=65536):
+            if chunk:
+                yield chunk
+
+    return Response(generate(), status=upstream.status_code, headers=response_headers)
 
 
 if __name__ == "__main__":

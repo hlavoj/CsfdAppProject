@@ -51,11 +51,11 @@ def format_stream(result: dict, episode_label: Optional[str] = None) -> dict:
         desc_lines.append(result["ai_reasoning"])
 
     return {
-        "url": f"{ADDON_URL}/stream-redirect/{result['ident']}",
+        "url": f"{ADDON_URL}/stream-proxy/{result['ident']}",
         "name": name,
         "description": "\n".join(desc_lines),
         "behaviorHints": {
-            "notWebReady": True,
+            "notWebReady": False,
             "videoSize": result["size"],
             "filename": result["name"],
         },
