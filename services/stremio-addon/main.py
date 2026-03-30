@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from flask import Flask, jsonify, abort, request, Response
+from flask import Flask, jsonify, redirect, abort, request, Response
 import requests as req_lib
 from services.cache import TTLCache
 from services.tmdb import get_tmdb_id, get_tmdb_tv_id
@@ -77,6 +77,14 @@ def stream(content_type: str, video_id: str):
     print(f"  Got {len(results)} results from MediaFinder")
     _cache.set(video_id, streams)
     return jsonify({"streams": streams, "cacheMaxAge": 600})
+
+
+@app.route("/stream-redirect/<ident>")
+def stream_redirect(ident: str):
+    url = get_file_link(ident)
+    if not url:
+        abort(404)
+    return redirect(url, 302)
 
 
 @app.route("/stream-proxy/<ident>")
