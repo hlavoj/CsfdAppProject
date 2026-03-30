@@ -65,23 +65,82 @@ Stremio sends series episode IDs as `{imdb_id}:{season}:{episode}`, e.g.:
 The addon parses this format, looks up the TMDB TV show ID, and passes season/episode
 to MediaSourceFinder which adjusts search queries and AI ranking accordingly.
 
-## Flow — Movies
+## Flow — Stream List Request (Movies & Series)
 
-1. Stremio calls `/stream/movie/tt1375666.json`
-2. Check in-memory cache (10 min TTL)
-3. On miss: TMDB `find` lookup (`movie_results`) → get TMDB movie ID
-4. Call MediaSourceFinder `GET /search?tmdb_id=...&limit=5`
-5. Format results: quality label, audio tracks, size, AI match %
-6. Return stream objects with `url = /stream-redirect/{ident}`
+```
+Stremio App / Android TV
+        │
+        │  GET /stream/movie/tt1375666.json
+        │  GET /stream/series/tt2442560:2:1.json
+        ▼
+┌─────────────────────┐
+│   stremio-addon     │  check in-memory cache (10 min TTL)
+│   Flask :7000       │
+└──────────┬──────────┘
+           │ cache miss
+           │  GET /find/{imdb_id}?external_source=imdb_id
+           ▼
+       TMDB API
+           │  movie_results[0].id  OR  tv_results[0].id
+           │
+           ▼
+┌─────────────────────┐
+│   stremio-addon     │
+└──────────┬──────────┘
+           │  GET /search?tmdb_id=...&season=S&episode=E&limit=5
+           ▼
+┌──────────────────────────┐
+│   media-source-finder    │  (internal Docker DNS, never public)
+│   FastAPI :8080          │
+└──────┬───────────────────┘
+       │
+       ├── POST /api/search/ ×2 parallel ──► Webshare API
+       │     "{title_cz} S02E01 CZ"
+       │     "{title_en} S02E01"
+       │
+       ├── heuristic pre-filter (top 15)
+       │
+       ├── AI ranking ────────────────────► OpenRouter (llama-3.1-8b)
+       │     match_probability 0-100%
+       │
+       └── POST /api/file_link/ ×N parallel ► Webshare API
+           POST /api/file_info/ ×N parallel
+           │
+           ▼
+┌─────────────────────┐
+│   stremio-addon     │  format stream objects, store in cache
+└──────────┬──────────┘
+           │  {"streams": [...], "cacheMaxAge": 0}
+           ▼
+    Stremio App  ←── shows stream picker to user
+```
 
-## Flow — Series
+## Flow — Video Playback (after user picks a stream)
 
-1. Stremio calls `/stream/series/tt2442560:2:1.json`
-2. Check in-memory cache (10 min TTL)
-3. On miss: TMDB `find` lookup (`tv_results`) → get TMDB TV show ID
-4. Call MediaSourceFinder `GET /search?tmdb_id=...&season=2&episode=1&limit=5`
-5. Format results: `S02E01 • 1080p • CZ` stream name, with episode label
-6. Return stream objects
+```
+Stremio / Android TV
+        │
+        │  GET /stream-redirect/{ident}
+        ▼
+┌─────────────────────┐
+│   stremio-addon     │  POST /api/file_link/{ident} → fresh CDN URL
+│   Flask :7000       │
+└──────────┬──────────┘
+           │  302 Redirect → https://cdn.wsfiles.cz/...?token=...
+           ▼
+Stremio / Android TV
+        │
+        │  GET https://cdn.wsfiles.cz/...  (Range requests for seeking)
+        ▼
+   Webshare CDN
+        │
+        │  video bytes (direct — no VPS involved)
+        ▼
+Stremio / Android TV  ◄── video plays
+```
+
+Video bytes go **directly** from Webshare CDN to the device. The VPS only handles
+the short redirect lookup — zero streaming bandwidth through the VPS.
 
 ## Stream Object Format
 

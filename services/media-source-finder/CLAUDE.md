@@ -118,6 +118,64 @@ curl "http://localhost:8080/search?tmdb_id=60574&season=2&episode=1&limit=3"  # 
 
 ## Service Flow
 
+```
+GET /search?tmdb_id=27205&limit=5
+        │
+        ▼
+┌──────────────────────────────────────────────────────┐
+│ 1. Validate — exactly one of imdb_id/tmdb_id/csfd_id │
+└──────────────────┬───────────────────────────────────┘
+                   │
+          ┌────────┴────────┐
+          │                 │
+     imdb_id            tmdb_id (+ season/episode for series)
+          │                 │
+          ▼                 ▼
+      OMDB API          TMDB API
+    (EN title+year)  (CZ+EN titles, runtime,
+                      genres, episode title)
+          │                 │
+          └────────┬────────┘
+                   │  MovieInfo built
+                   ▼
+┌──────────────────────────────────────────────────────┐
+│ 2. Webshare auth (cached WST token)                  │
+│    POST /api/salt/ → md5crypt+sha1 → POST /api/login/│
+└──────────────────┬───────────────────────────────────┘
+                   │
+        ┌──────────┴──────────┐  parallel
+        ▼                     ▼
+  Webshare search         Webshare search
+  "{title_cz} S02E01 CZ"  "{title_en} S02E01"
+  POST /api/search/        POST /api/search/
+        │                     │
+        └──────────┬──────────┘
+                   │  merge + dedup by ident
+                   │  drop non-video extensions
+                   │  up to 40 candidates
+                   ▼
+┌──────────────────────────────────────────────────────┐
+│ 3. Heuristic pre-filter → top 15                     │
+│    title_en +6, title_cz +4, year +3, CZ +3          │
+│    SxxExx match +10, wrong episode -20, no ep -5     │
+└──────────────────┬───────────────────────────────────┘
+                   │
+                   ▼
+        OpenRouter API (llama-3.1-8b)
+        rank_results() → match_probability 0-100%
+                   │
+                   ▼
+┌──────────────────────────────────────────────────────┐
+│ 4. Parallel fetch for top N results                  │
+│    POST /api/file_link/ → CDN URL                    │
+│    POST /api/file_info/ → codec, resolution, audio   │
+└──────────────────┬───────────────────────────────────┘
+                   │
+                   ▼
+           SearchResponse JSON
+```
+
+**Steps in plain text:**
 1. **Validate** — exactly one of `imdb_id` / `tmdb_id` / `csfd_id`
 2. **Movie/episode metadata**
    - `imdb_id` → `omdb.py` → OMDB API → English title + year
