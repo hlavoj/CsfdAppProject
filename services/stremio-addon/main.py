@@ -55,7 +55,7 @@ def stream(content_type: str, video_id: str):
     cached = _cache.get(video_id)
     if cached is not None:
         print(f"Cache hit: {video_id}")
-        return jsonify({"streams": cached, "cacheMaxAge": 600})
+        return jsonify({"streams": cached, "cacheMaxAge": 0})
 
     print(f"Resolving streams for {video_id} ({content_type}) ...")
 
@@ -76,7 +76,7 @@ def stream(content_type: str, video_id: str):
 
     print(f"  Got {len(results)} results from MediaFinder")
     _cache.set(video_id, streams)
-    return jsonify({"streams": streams, "cacheMaxAge": 600})
+    return jsonify({"streams": streams, "cacheMaxAge": 0})
 
 
 @app.route("/stream-redirect/<ident>")
