@@ -38,6 +38,9 @@ python main.py
 
 ## Install in Stremio
 
+**Production (VPS):** `https://srv1475341.hstgr.cloud/manifest.json`
+
+**Local dev:**
 1. Run both MediaSourceFinder (port from .env) and this addon (port 7000)
 2. Open Stremio -> Addons -> paste in URL bar:
    `http://127.0.0.1:7000/manifest.json`
@@ -101,3 +104,50 @@ For movies the name omits the episode label: `"1080p • CZ"`
 
 Results cached in memory per video_id (IMDB ID for movies, `imdb_id:season:episode` for series) for 10 minutes.
 Stream URLs point to `/stream-redirect/` which always fetches a fresh CDN link — so cached results never produce expired URLs.
+
+`cacheMaxAge: 0` is returned in every stream response so Stremio never caches the stream list on its side either.
+
+## Known Behaviour & Hard-Won Lessons
+
+### Black screen on second play (Stremio caching bug)
+**Symptom:** First play works fine (even 4K). Second play of the same file shows black screen
+with subtitles still changing — audio silent.
+
+**Root cause:** Stremio caches the *final destination URL* (the Webshare CDN URL) after
+the first 302 redirect. Webshare CDN tokens expire. On the second play Stremio reuses the
+stale CDN URL directly, bypassing `/stream-redirect/`, so the token is expired → black screen.
+Subtitles still run because they were fully buffered on the first play.
+
+**Fix applied:**
+- `cacheMaxAge: 0` — tells Stremio not to cache the stream list
+- `notWebReady: true` — signals that the URL is not a plain HTTP byte stream,
+  suppresses web Stremio's inline player (which doesn't handle redirects well)
+- `/stream-redirect/{ident}` always fetches a fresh Webshare CDN URL on every play
+
+**Why not proxy?** A `/stream-proxy/` endpoint (routing bytes through VPS) was tested and
+worked around the caching issue, but the VPS plan (KVM 1, 4 GB RAM) has limited bandwidth.
+Webshare CDN URLs are **not IP-restricted** — confirmed by fetching a CDN URL from a
+different IP address (got HTTP 206). Direct redirect is safe and preferred.
+
+### notWebReady: true and web Stremio
+`notWebReady: true` causes web Stremio (web.stremio.com) to show an infinite spinner /
+"still loading" state. This is expected — web Stremio cannot play non-web-ready streams.
+Android TV and desktop Stremio apps handle them fine.
+
+### AI model returns dict instead of array for single result
+When the OpenRouter `llama-3.1-8b-instruct` model has only one candidate, it sometimes
+returns a single JSON object `{"ident":"...","match_probability":85}` instead of an array.
+The fix in `gemini.py` normalises this:
+```python
+if isinstance(ranked, dict):
+    if "ident" in ranked:
+        ranked = [ranked]
+    else:
+        ranked = next((v for v in ranked.values() if isinstance(v, list)), [])
+```
+
+### Series pre-filter scoring
+Wrong SxxExx notation is penalised heavily so episodes don't cross-contaminate:
+- SxxExx exact match in filename: **+10**
+- Different SxxExx in filename: **−20** (e.g. S02E02 file when searching S03E02)
+- No episode notation at all: **−5**
