@@ -26,6 +26,7 @@ stremio-addon/
 | `MEDIA_FINDER_URL`  | Base URL of MediaSourceFinder service          |
 | `TMDB_API_KEY`      | TMDB API key (for IMDB->TMDB ID resolution)    |
 | `ADDON_URL`         | Public/local URL of this addon (for stream-redirect URLs) |
+| `POSTGRES_URL`      | PostgreSQL connection string for stream cache  |
 
 ## Running
 
@@ -55,6 +56,7 @@ python main.py
 | `GET /stream/movie/{imdb_id}.json` | Stream list for a movie |
 | `GET /stream/series/{imdb_id}:{season}:{episode}.json` | Stream list for a series episode |
 | `GET /stream-redirect/{ident}` | Resolves fresh Webshare CDN URL and redirects (302) |
+| `GET /refresh/{video_id}` | Clears postgres + in-memory cache, returns HTML confirmation |
 
 ## Series ID Format
 
@@ -161,10 +163,37 @@ For movies the name omits the episode label: `"1080p • CZ"`
 
 ## Caching
 
-Results cached in memory per video_id (IMDB ID for movies, `imdb_id:season:episode` for series) for 10 minutes.
-Stream URLs point to `/stream-redirect/` which always fetches a fresh CDN link — so cached results never produce expired URLs.
+Two-layer cache — L1 (in-memory) on top of L2 (PostgreSQL):
 
-`cacheMaxAge: 0` is returned in every stream response so Stremio never caches the stream list on its side either.
+```
+Request arrives
+    │
+    ├─ L1 hit (in-memory, 10 min TTL) ──► return immediately, no DB touch
+    │
+    ├─ L2 hit (postgres, smart TTL) ────► increment hit_count, build response, warm L1
+    │     TTL: this year's movies = 3 days (new rips appear quickly)
+    │          older movies + series = 14 days
+    │
+    └─ Miss ─────────────────────────────► fetch fresh (~5-10s), store in postgres, warm L1
+```
+
+Every response always includes a **🔄 Force refresh** stream entry at the bottom showing
+`Cached Xd ago • played N×` so users can manually bust the cache at any time.
+
+`cacheMaxAge: 0` is returned in every stream response so Stremio never caches the stream
+list on its side.
+
+### Why smart TTL?
+14 days is not about files disappearing — it's about new higher-quality rips being uploaded.
+Popular new releases get better rips within days of release, so they get a 3-day TTL.
+Older movies are stable — 14 days is fine.
+
+### Force refresh flow
+1. User clicks **🔄 Force refresh** in Stremio stream picker
+2. Stremio "plays" `GET /refresh/{video_id}`
+3. Addon deletes row from postgres + evicts from L1
+4. Returns HTML page: *"Cache cleared. Go back and reopen."*
+5. User reopens movie → cache miss → fresh fetch
 
 ## Known Behaviour & Hard-Won Lessons
 
