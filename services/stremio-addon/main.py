@@ -1,19 +1,27 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+from datetime import datetime, timezone
+
 from flask import Flask, jsonify, redirect, abort, request, Response
 import requests as req_lib
 from services.cache import TTLCache
-from services.tmdb import get_tmdb_id, get_tmdb_tv_id
+from services.tmdb import get_tmdb_id, get_tmdb_id_and_year, get_tmdb_tv_id
 from services.media_finder import search_streams, get_file_link
-from services.formatter import format_streams
+from services.formatter import format_streams, format_refresh_stream
+from services.db import init_db, cache_get, cache_set, cache_increment_hit, cache_delete
 
 app = Flask(__name__)
 _cache: TTLCache = TTLCache(ttl_seconds=600)
 
+try:
+    init_db()
+except Exception as e:
+    print(f"DB init failed (will retry on first request): {e}")
+
 MANIFEST = {
     "id": "com.csfdapp.mediasourcefinder",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "name": "MediaSource CZ",
     "description": "Czech streams from Webshare.cz, AI-ranked",
     "types": ["movie", "series"],
@@ -52,12 +60,26 @@ def stream(content_type: str, video_id: str):
     if content_type not in ("movie", "series"):
         return jsonify({"streams": [], "cacheMaxAge": 0})
 
-    cached = _cache.get(video_id)
-    if cached is not None:
-        print(f"Cache hit: {video_id}")
-        return jsonify({"streams": cached, "cacheMaxAge": 0})
+    # L1: in-memory cache (10 min) — avoids hitting postgres on rapid re-opens
+    cached_l1 = _cache.get(video_id)
+    if cached_l1 is not None:
+        print(f"L1 cache hit: {video_id}")
+        return jsonify({"streams": cached_l1, "cacheMaxAge": 0})
 
-    print(f"Resolving streams for {video_id} ({content_type}) ...")
+    # L2: postgres cache
+    cached_l2 = cache_get(video_id)
+    if cached_l2 is not None:
+        age_days = (datetime.now(timezone.utc) - cached_l2["cached_at"]).days
+        print(f"L2 cache hit: {video_id} (age {age_days}d, hits {cached_l2['hit_count']})")
+        cache_increment_hit(video_id)
+        refresh = format_refresh_stream(video_id, cached_l2["cached_at"], cached_l2["hit_count"] + 1)
+        streams = cached_l2["results"] + [refresh]
+        _cache.set(video_id, streams)
+        return jsonify({"streams": streams, "cacheMaxAge": 0})
+
+    # Cache miss — fetch fresh
+    print(f"Cache miss, fetching: {video_id} ({content_type}) ...")
+    movie_year = None
 
     if content_type == "series":
         imdb_id, season, episode = _parse_series_id(video_id)
@@ -68,15 +90,45 @@ def stream(content_type: str, video_id: str):
         streams = format_streams(results, season=season, episode=episode)
     else:
         imdb_id = video_id
-        season, episode = None, None
-        tmdb_id = get_tmdb_id(imdb_id)
-        print(f"  TMDB ID: {tmdb_id}")
+        tmdb_id, movie_year = get_tmdb_id_and_year(imdb_id)
+        print(f"  TMDB ID: {tmdb_id}, year: {movie_year}")
         results = search_streams(tmdb_id=tmdb_id) if tmdb_id else search_streams(imdb_id=imdb_id)
         streams = format_streams(results)
 
     print(f"  Got {len(results)} results from MediaFinder")
-    _cache.set(video_id, streams)
-    return jsonify({"streams": streams, "cacheMaxAge": 0})
+
+    # Store in postgres (only if we got results)
+    if streams:
+        cache_set(video_id, streams, movie_year)
+
+    # Always append refresh button
+    refresh = format_refresh_stream(video_id, datetime.now(timezone.utc), 0)
+    streams_with_refresh = streams + [refresh]
+
+    _cache.set(video_id, streams_with_refresh)
+    return jsonify({"streams": streams_with_refresh, "cacheMaxAge": 0})
+
+
+@app.route("/refresh/<path:video_id>")
+def refresh_cache(video_id: str):
+    deleted = cache_delete(video_id)
+    _cache.delete(video_id)
+    status = "deleted" if deleted else "not found (already fresh)"
+    print(f"Cache refresh triggered for {video_id}: {status}")
+    return (
+        f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Cache cleared</title>
+<style>body{{font-family:sans-serif;text-align:center;padding:60px;background:#1a1a2e;color:#eee}}
+h1{{color:#e94560}}p{{color:#aaa}}</style></head>
+<body>
+<h1>🔄 Cache cleared</h1>
+<p>Go back to Stremio and reopen the movie or episode.<br>Fresh results will be fetched.</p>
+<p style="font-size:0.8em;color:#555">{video_id} — {status}</p>
+</body></html>""",
+        200,
+        {"Content-Type": "text/html"},
+    )
 
 
 @app.route("/stream-redirect/<ident>")

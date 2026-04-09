@@ -1,4 +1,19 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=stremio
+      - POSTGRES_USER=stremio
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stremio -d stremio"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   media-source-finder:
     build: ./services/media-source-finder
     restart: unless-stopped
@@ -12,15 +27,22 @@ services:
   stremio-addon:
     build: ./services/stremio-addon
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       - MEDIA_FINDER_URL=http://media-source-finder:8080
       - TMDB_API_KEY=${TMDB_API_KEY}
       - ADDON_URL=${ADDON_URL}
       - FLASK_HOST=0.0.0.0
       - FLASK_PORT=7000
+      - POSTGRES_URL=postgresql://stremio:${POSTGRES_PASSWORD}@postgres:5432/stremio
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.stremio.rule=Host(`${DOMAIN}`)"
       - "traefik.http.routers.stremio.entrypoints=websecure"
       - "traefik.http.routers.stremio.tls.certresolver=letsencrypt"
       - "traefik.http.services.stremio.loadbalancer.server.port=7000"
+
+volumes:
+  postgres_data:

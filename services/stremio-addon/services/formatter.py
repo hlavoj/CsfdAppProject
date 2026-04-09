@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 from typing import Optional
 
 ADDON_URL = os.getenv("ADDON_URL", "http://127.0.0.1:7000")
@@ -68,3 +69,14 @@ def format_streams(results: list[dict], season: Optional[int] = None, episode: O
     ADDON_URL = os.getenv("ADDON_URL", "http://127.0.0.1:7000")
     episode_label = f"S{season:02d}E{episode:02d}" if season is not None and episode is not None else None
     return [format_stream(r, episode_label) for r in results if r.get("url")]
+
+
+def format_refresh_stream(video_id: str, cached_at: datetime, hit_count: int) -> dict:
+    addon_url = os.getenv("ADDON_URL", "http://127.0.0.1:7000")
+    age_days = (datetime.now(timezone.utc) - cached_at).days
+    return {
+        "url": f"{addon_url}/refresh/{video_id}",
+        "name": "🔄 Force refresh",
+        "description": f"Cached {age_days}d ago • played {hit_count}×\nFetches fresh results from Webshare",
+        "behaviorHints": {"notWebReady": True},
+    }

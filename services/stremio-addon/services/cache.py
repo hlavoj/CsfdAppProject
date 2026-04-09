@@ -18,3 +18,6 @@ class TTLCache:
 
     def set(self, key: str, value: Any) -> None:
         self._store[key] = (time.time(), value)
+
+    def delete(self, key: str) -> None:
+        self._store.pop(key, None)
