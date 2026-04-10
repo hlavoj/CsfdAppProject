@@ -16,7 +16,7 @@ stremio-addon/
 ├── services/
 │   ├── cache.py             # L1 in-memory TTL cache (10 min)
 │   ├── db.py                # L2 PostgreSQL cache — one row per stream
-│   ├── tmdb.py              # IMDB ID -> TMDB movie/TV ID + release year lookup
+│   ├── tmdb.py              # IMDB ID -> TMDB movie/TV ID + release year + poster/name lookup
 │   ├── media_finder.py      # MediaSourceFinder HTTP client (default limit=10)
 │   └── formatter.py         # Format results as Stremio stream objects
 ```
@@ -208,9 +208,17 @@ page. Managed entirely in PostgreSQL — no redeployment needed to add/remove ti
 1. `GET /manifest.json` is called on every Stremio refresh. It reads the `catalogs` table
    from DB and includes each row as a catalog entry.
 2. Stremio calls `GET /catalog/{type}/{catalog_id}.json` to populate each category.
-3. The addon returns a list of `{"id": "tt...", "type": "movie|series"}` objects.
-4. Stremio passes those IMDB IDs to **Cinemeta** (its built-in metadata service) which
-   provides posters, titles, descriptions, ratings automatically — no extra work needed.
+3. The addon fetches `name` and `poster` for each IMDB ID from TMDB in parallel (up to 8
+   concurrent requests via `ThreadPoolExecutor`) and returns full meta objects.
+4. Stremio uses the returned `name` and `poster` fields to render the catalog row with
+   images. When the user opens a title, Cinemeta provides full detail (description, rating, etc).
+
+**Why fetch from TMDB instead of relying on Cinemeta enrichment?**
+Stremio does not automatically enrich catalog entries from Cinemeta when your addon returns
+only `{"id": "tt...", "type": "movie"}` — it just shows blank tiles. You must return `name`
+and `poster` yourself for the catalog grid to render correctly.
+
+**TMDB poster URL format:** `https://image.tmdb.org/t/p/w500{poster_path}`
 
 ### Database tables
 
@@ -258,6 +266,10 @@ ON CONFLICT (catalog_id, imdb_id) DO NOTHING;
 
 The manifest is rebuilt on the next Stremio refresh — no addon restart needed.
 The in-memory catalog cache (L1) expires after 10 minutes.
+
+**Adding a new catalog** requires the user to **reinstall the addon** in Stremio (uninstall →
+paste manifest URL → install) so Stremio picks up the new catalog from the manifest.
+Existing catalog changes (new titles) appear automatically on next catalog refresh.
 
 ## Known Behaviour & Hard-Won Lessons
 
