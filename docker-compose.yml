@@ -24,6 +24,14 @@ services:
       - TMDB_API_KEY=${TMDB_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
 
+  adminer:
+    image: adminer:latest
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
+    depends_on:
+      - postgres
+
   stremio-addon:
     build: ./services/stremio-addon
     restart: unless-stopped
