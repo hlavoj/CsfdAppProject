@@ -87,7 +87,7 @@ async def search(
     csfd_id: Optional[str] = Query(None, description="CSFD ID (not yet implemented)"),
     season: Optional[int] = Query(None, description="Season number (for series)"),
     episode: Optional[int] = Query(None, description="Episode number (for series)"),
-    limit: int = Query(5, ge=1, le=20, description="Number of results to return"),
+    limit: int = Query(10, ge=1, le=20, description="Number of results to return"),
 ):
     t_total = time.perf_counter()
     query_id = imdb_id or tmdb_id or csfd_id
@@ -131,15 +131,15 @@ async def search(
         logger.info(f"  TOTAL                                         {_ms(t_total)}  (0 results)")
         return SearchResponse(query=f"{cz_query} / {en_query}", movie=movie, results=[])
 
-    # 5. AI ranking (pre-filter happens inside rank_results)
-    from services.gemini import AI_CANDIDATE_LIMIT
+    # 5. Ranking (Python scorer, AI fallback when scores are ambiguous)
+    from services.gemini import AI_CANDIDATE_LIMIT, AMBIGUITY_THRESHOLD
     t = time.perf_counter()
     try:
         ranked = await rank_results(movie, candidates, limit)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"AI ranking failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Ranking failed: {e}")
     sent = min(len(candidates), AI_CANDIDATE_LIMIT)
-    logger.info(f"  4. gemini ranking (prefilter {len(candidates)}→{sent}, top {limit})  {_ms(t)}")
+    logger.info(f"  4. ranking (python+ai fallback, {len(candidates)}→{sent}→{limit})   {_ms(t)}")
 
     # 6. Parallel file_link + file_info for top N
     t = time.perf_counter()

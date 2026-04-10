@@ -12,7 +12,7 @@ def search_streams(
     imdb_id: Optional[str] = None,
     season: Optional[int] = None,
     episode: Optional[int] = None,
-    limit: int = 5,
+    limit: int = 10,
 ) -> list[dict]:
     params: dict = {"limit": limit}
     if tmdb_id:

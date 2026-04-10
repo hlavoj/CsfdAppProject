@@ -1,7 +1,11 @@
 """
-AI ranking service — OpenRouter backend.
+Ranking service for Webshare video candidates.
+
+Primary:  rich Python scorer — fast, deterministic, no API cost.
+Fallback: OpenRouter LLM — only called when Python scores are too close to
+          distinguish confidently (spread between top-N scores < AMBIGUITY_THRESHOLD).
+
 Interface: rank_results(movie, candidates, limit) -> list[dict]
-Swap the MODEL constant or provider URL to change the underlying LLM.
 """
 import os
 import json
@@ -9,59 +13,134 @@ import re
 import httpx
 from models.media_source import MovieInfo
 
-_SXEX_RE = re.compile(r's\d{1,2}e\d{1,2}')
+_SXEX_RE = re.compile(r's(\d{1,2})e(\d{1,2})', re.IGNORECASE)
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-MODEL = "meta-llama/llama-3.1-8b-instruct"
+MODEL = "google/gemini-2.0-flash-001"
 
-# Max candidates sent to AI — pre-filter reduces noise and token count
+# How many top Python-scored candidates to send to AI when fallback triggers
 AI_CANDIDATE_LIMIT = 15
 
+# If the score spread across the top-N results is below this,
+# Python can't confidently separate them — call AI to break ties.
+AMBIGUITY_THRESHOLD = 15
 
-def _sxex(season: int, episode: int) -> str:
-    return f"s{season:02d}e{episode:02d}"
 
+# ---------------------------------------------------------------------------
+# Python scorer
+# ---------------------------------------------------------------------------
 
-def _prefilter(candidates: list[dict], movie: MovieInfo) -> list[dict]:
-    """
-    Score candidates with cheap string heuristics and keep the top AI_CANDIDATE_LIMIT.
-    Runs before the AI call to reduce prompt size and response time.
-    """
-    title_cz = movie.title.lower()
-    title_en = movie.original_title.lower()
-    year = movie.year
-    is_series = movie.media_type == "series"
+def _score(c: dict, movie: MovieInfo) -> int:
+    name = c["name"].lower()
+    s = 0
 
-    def score(c: dict) -> int:
-        name = c["name"].lower()
-        s = 0
-        if title_en in name:                                  s += 6
-        if title_cz in name:                                  s += 4
-        if year in name:                                      s += 3
-        if " cz" in name or ".cz" in name or "_cz" in name:  s += 3
-        if "dabing" in name or "dab." in name:                s += 2
-        if "1080" in name:                                    s += 1
-        if "2160" in name or "4k" in name:                    s += 1
-        # Series: exact SxxExx match is highest-value signal
-        if is_series and movie.season is not None and movie.episode is not None:
-            sxex = _sxex(movie.season, movie.episode)
-            alt = f"s{movie.season}e{movie.episode}"
-            if sxex in name:                                  s += 10
-            elif alt in name:                                 s += 8
-            found = _SXEX_RE.findall(name)
-            if found:
-                # File has SxxExx — penalize if it's a different episode
-                if sxex not in found and alt not in found:
-                    s -= 20  # wrong episode — hard exclude
+    # --- Title match --------------------------------------------------------
+    title_en = (movie.original_title or "").lower().strip()
+    title_cz = (movie.title or "").lower().strip()
+    if title_en and title_en in name:   s += 15
+    if title_cz and title_cz in name:   s += 12
+
+    # --- Year ---------------------------------------------------------------
+    if movie.year and movie.year in name:  s += 8
+
+    # --- Czech audio signals ------------------------------------------------
+    if "dabing" in name or " dab " in name or ".dab." in name:  s += 8
+    # CZ label patterns: " cz " / ".cz." / "(cz)" / "-cz-" / filename ends with .cz
+    if re.search(r'(?:^|[\s._(-])cz(?:[\s._)\[]|$)', name):    s += 10
+    elif ".cz" in name:                                          s += 5
+    if "czech" in name:                                          s += 7
+    # Penalise subtitles-only releases
+    if "titulky" in name:                                        s -= 10
+    if re.search(r'\bsubs?\b', name) and "dabing" not in name:  s -= 5
+
+    # --- Source / encode quality --------------------------------------------
+    if "remux" in name:                                          s += 10
+    elif re.search(r'blu.?ray|bdrip|brrip', name):               s += 6
+    elif re.search(r'web.?dl', name):                            s += 4
+    elif re.search(r'web.?rip', name):                           s += 2
+    elif "hdtv" in name:                                         s += 1
+
+    # --- Resolution ---------------------------------------------------------
+    if re.search(r'2160p|4k|uhd', name):                         s += 8
+    elif "1080" in name:                                         s += 5
+    elif "720" in name:                                          s += 2
+
+    # --- Audio codec --------------------------------------------------------
+    if re.search(r'truehd|dts.hd|dts-hd', name):                s += 3
+    elif "dts" in name:                                          s += 2
+    elif re.search(r'ac3|dd5|aac', name):                        s += 1
+
+    # --- File size as quality proxy (GB) ------------------------------------
+    size_gb = c.get("size", 0) / 1_073_741_824
+    if size_gb >= 20:    s += 4
+    elif size_gb >= 10:  s += 3
+    elif size_gb >= 5:   s += 2
+    elif size_gb >= 2:   s += 1
+
+    # --- Community votes ----------------------------------------------------
+    s += min(c.get("positive_votes", 0), 3) * 2   # cap bonus at +6
+    s -= c.get("negative_votes", 0) * 3
+
+    # --- Series: SxxExx match -----------------------------------------------
+    if movie.media_type == "series" and movie.season is not None and movie.episode is not None:
+        target_s = f"s{movie.season:02d}e{movie.episode:02d}"
+        target_alt = f"s{movie.season}e{movie.episode}"
+        found = [(int(m.group(1)), int(m.group(2))) for m in _SXEX_RE.finditer(name)]
+        if found:
+            if any(f == (movie.season, movie.episode) for f in found):
+                s += 15   # exact episode match
             else:
-                # No episode notation — slight penalty (prefer explicit matches)
-                s -= 5
-        s += c.get("positive_votes", 0)
-        s -= c.get("negative_votes", 0) * 2
-        return s
+                s -= 25   # wrong episode — near-exclude
+        else:
+            if target_s in name or target_alt in name:
+                s += 15   # matched via simpler pattern
+            else:
+                s -= 8    # no episode notation at all
 
-    return sorted(candidates, key=score, reverse=True)[:AI_CANDIDATE_LIMIT]
+    return s
 
+
+def _python_rank(candidates: list[dict], movie: MovieInfo, limit: int) -> list[tuple[int, dict]]:
+    """Return (score, candidate) pairs sorted descending, limited to top AI_CANDIDATE_LIMIT."""
+    scored = sorted(
+        [(_score(c, movie), c) for c in candidates],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    return scored[:AI_CANDIDATE_LIMIT]
+
+
+def _is_ambiguous(scored: list[tuple[int, dict]], limit: int) -> bool:
+    """True when top-N Python scores are too close to rank confidently."""
+    top = scored[:min(limit, len(scored))]
+    if len(top) < 2:
+        return False
+    return (top[0][0] - top[-1][0]) < AMBIGUITY_THRESHOLD
+
+
+def _to_ranked(scored: list[tuple[int, dict]], limit: int) -> list[dict]:
+    """Convert (score, candidate) pairs to result dicts with normalised match_probability."""
+    top = scored[:limit]
+    if not top:
+        return []
+    max_s = top[0][0]
+    results = []
+    for s, c in top:
+        if max_s > 0:
+            prob = max(10, min(95, int(s / max_s * 85) + 10))
+        else:
+            prob = max(10, min(50, 50 + s))   # for zero/negative scores
+        results.append({
+            "ident": c["ident"],
+            "match_probability": prob,
+            "reasoning": f"python score {s}",
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# AI fallback (OpenRouter)
+# ---------------------------------------------------------------------------
 
 def _build_prompt(movie: MovieInfo, candidates: list[dict], limit: int) -> str:
     candidates_json = json.dumps(
@@ -79,18 +158,15 @@ def _build_prompt(movie: MovieInfo, candidates: list[dict], limit: int) -> str:
             f"{sxex}{ep_title} ({movie.year}{runtime_line})"
         )
         hints = (
-            f"This is a TV series episode {sxex}. "
-            f"SxxExx match is the most critical signal — wrong episode = 0%. "
-            f"Czech dubbing preferred, subtitles acceptable. "
-            f"'CZ dabing'=dubbed, '&' becomes 'a' in Czech titles, diacritics often stripped. "
-            f"Quality: 2160p>1080p>720p. votes=community trust."
+            f"TV series episode {sxex}. SxxExx match is most critical — wrong episode = 0%. "
+            f"Czech dubbing preferred. '&' becomes 'a' in Czech, diacritics often stripped."
         )
     else:
         target = f"{movie.title} / {movie.original_title} ({movie.year}{runtime_line})"
         hints = (
             f"Czech dubbing preferred, subtitles acceptable. "
             f"'CZ dabing'=dubbed, '&' becomes 'a' in Czech titles, diacritics often stripped. "
-            f"Quality: 2160p>1080p>720p. votes=community trust."
+            f"Quality: Remux>BluRay>WEB-DL. Resolution: 2160p>1080p>720p."
         )
 
     return (
@@ -98,56 +174,69 @@ def _build_prompt(movie: MovieInfo, candidates: list[dict], limit: int) -> str:
         f"Files: {candidates_json}\n"
         f"Return JSON array of top {limit} sorted best-first: "
         f'[{{"ident":"...","match_probability":85,"reasoning":"short"}}]. '
-        f"match_probability is 0-100 int. JSON only."
+        f"match_probability is 0-100 int. JSON only, no markdown."
     )
 
 
 def _parse_response(text: str) -> list[dict]:
-    """Extract JSON array from response, stripping any markdown fences."""
     text = text.strip()
-    # Strip ```json ... ``` fences if present
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-    return json.loads(text.strip())
+    ranked = json.loads(text.strip())
+    # Normalise: model sometimes returns a single dict or wrapped object
+    if isinstance(ranked, dict):
+        if "ident" in ranked:
+            ranked = [ranked]
+        else:
+            ranked = next((v for v in ranked.values() if isinstance(v, list)), [])
+    return ranked
 
 
-async def rank_results(movie: MovieInfo, candidates: list[dict], limit: int) -> list[dict]:
-    """
-    Pre-filters candidates with heuristics, sends top AI_CANDIDATE_LIMIT to OpenRouter.
-    Returns top `limit` items as list of {ident, match_probability, reasoning}.
-    """
-    filtered = _prefilter(candidates, movie)
+async def _ai_rank(movie: MovieInfo, candidates: list[dict], limit: int) -> list[dict]:
     api_key = os.getenv("OPENROUTER_API_KEY")
-
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             f"{OPENROUTER_BASE}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={
                 "model": MODEL,
-                "messages": [{"role": "user", "content": _build_prompt(movie, filtered, limit)}],
+                "messages": [{"role": "user", "content": _build_prompt(movie, candidates, limit)}],
                 "temperature": 0.1,
-                "max_tokens": 600,
+                "max_tokens": 800,
                 "response_format": {"type": "json_object"},
             },
         )
         resp.raise_for_status()
 
     text = resp.json()["choices"][0]["message"]["content"]
-    ranked: list[dict] = _parse_response(text)
-
-    # Normalize: model sometimes returns a single dict or wrapped object instead of an array
-    if isinstance(ranked, dict):
-        if "ident" in ranked:
-            # Single item returned as object {"ident":"...","match_probability":85}
-            ranked = [ranked]
-        else:
-            # Wrapped array {"results":[...]} or {"files":[...]}
-            ranked = next((v for v in ranked.values() if isinstance(v, list)), [])
+    ranked = _parse_response(text)
 
     # Guard against hallucinated idents
-    valid_idents = {c["ident"] for c in filtered}
+    valid_idents = {c["ident"] for c in candidates}
     ranked = [r for r in ranked if r.get("ident") in valid_idents]
-
     ranked.sort(key=lambda x: x.get("match_probability", 0), reverse=True)
     return ranked[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Public interface
+# ---------------------------------------------------------------------------
+
+async def rank_results(movie: MovieInfo, candidates: list[dict], limit: int) -> list[dict]:
+    """
+    Score candidates with Python heuristics.
+    Falls back to AI (gemini-2.0-flash) only when top scores are ambiguous.
+    Returns list of {ident, match_probability, reasoning}.
+    """
+    scored = _python_rank(candidates, movie, limit)
+
+    if _is_ambiguous(scored, limit):
+        top_candidates = [c for _, c in scored]
+        try:
+            ai_results = await _ai_rank(movie, top_candidates, limit)
+            if ai_results:
+                return ai_results
+        except Exception as e:
+            print(f"AI fallback failed ({e}), using Python scorer")
+
+    return _to_ranked(scored, limit)
