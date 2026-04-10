@@ -18,9 +18,10 @@ _cache: TTLCache = TTLCache(ttl_seconds=600)
 
 try:
     init_db()
-    start_background_sync()
 except Exception as e:
     print(f"DB init failed (will retry on first request): {e}")
+
+start_background_sync()
 
 @app.after_request
 def cors(response):
