@@ -54,7 +54,8 @@ python main.py
 
 | Route | Description |
 |-------|-------------|
-| `GET /manifest.json` | Stremio addon manifest |
+| `GET /manifest.json` | Stremio addon manifest (built dynamically from DB catalogs) |
+| `GET /catalog/{type}/{catalog_id}.json` | Catalog item list (IMDB IDs; Stremio fetches posters from Cinemeta) |
 | `GET /stream/movie/{imdb_id}.json` | Stream list for a movie |
 | `GET /stream/series/{imdb_id}:{season}:{episode}.json` | Stream list for a series episode |
 | `GET /stream-redirect/{ident}` | Resolves fresh Webshare CDN URL and redirects (302) |
@@ -196,6 +197,67 @@ Older movies are stable — 14 days is fine.
 3. Addon deletes row from postgres + evicts from L1
 4. Returns HTML page: *"Cache cleared. Go back and reopen."*
 5. User reopens movie → cache miss → fresh fetch
+
+## Catalogs
+
+Custom Stremio catalogs (e.g. "Kids Movies", "Kids Series") that appear on the Stremio home
+page. Managed entirely in PostgreSQL — no redeployment needed to add/remove titles.
+
+### How it works
+
+1. `GET /manifest.json` is called on every Stremio refresh. It reads the `catalogs` table
+   from DB and includes each row as a catalog entry.
+2. Stremio calls `GET /catalog/{type}/{catalog_id}.json` to populate each category.
+3. The addon returns a list of `{"id": "tt...", "type": "movie|series"}` objects.
+4. Stremio passes those IMDB IDs to **Cinemeta** (its built-in metadata service) which
+   provides posters, titles, descriptions, ratings automatically — no extra work needed.
+
+### Database tables
+
+```sql
+-- One row per category
+CREATE TABLE catalogs (
+    id       TEXT PRIMARY KEY,   -- e.g. 'kids_movies'
+    name     TEXT NOT NULL,      -- displayed in Stremio, e.g. 'Kids Movies'
+    type     TEXT NOT NULL,      -- 'movie' or 'series'
+    position INTEGER NOT NULL    -- sort order in manifest
+);
+
+-- One row per title in a category
+CREATE TABLE catalog_items (
+    id         SERIAL PRIMARY KEY,
+    catalog_id TEXT NOT NULL REFERENCES catalogs(id) ON DELETE CASCADE,
+    imdb_id    TEXT NOT NULL,    -- e.g. 'tt0114709'
+    position   INTEGER NOT NULL  -- sort order within the category
+);
+```
+
+### Seeded defaults
+
+| Catalog | ID | Items |
+|---------|----|-------|
+| Kids Movies | `kids_movies` | Toy Story, Lion King, Finding Nemo, Shrek, The Incredibles, Monsters Inc., Frozen, WALL-E, Up, Zootopia, Coco, Moana, Harry Potter 1, Spider-Man: Into the Spider-Verse, Encanto |
+| Kids Series | `kids_series` | Avatar: The Last Airbender, Gravity Falls, Phineas and Ferb, Adventure Time, SpongeBob, Peppa Pig, Miraculous Ladybug, Pokémon, Paw Patrol, Bluey, Wizards of Waverly Place, iCarly, My Little Pony, Dexter's Lab, Scooby-Doo |
+
+### Adding a new catalog or title (no deploy needed)
+
+Via **Adminer** (`http://<vps>:8090`, select PostgreSQL, database `csfd`):
+
+```sql
+-- Add a new catalog
+INSERT INTO catalogs (id, name, type, position) VALUES ('action_movies', 'Action Movies', 'movie', 2);
+
+-- Add a title to it
+INSERT INTO catalog_items (catalog_id, imdb_id, position) VALUES ('action_movies', 'tt0133093', 0);  -- The Matrix
+
+-- Add a title to an existing catalog
+INSERT INTO catalog_items (catalog_id, imdb_id, position)
+VALUES ('kids_movies', 'tt6105098', 15)  -- The Lion King (2019)
+ON CONFLICT (catalog_id, imdb_id) DO NOTHING;
+```
+
+The manifest is rebuilt on the next Stremio refresh — no addon restart needed.
+The in-memory catalog cache (L1) expires after 10 minutes.
 
 ## Known Behaviour & Hard-Won Lessons
 
