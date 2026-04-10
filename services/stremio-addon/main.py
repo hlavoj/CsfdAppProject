@@ -11,12 +11,14 @@ from services.tmdb import get_tmdb_id, get_tmdb_id_and_year, get_tmdb_tv_id, get
 from services.media_finder import search_streams, get_file_link
 from services.formatter import format_streams, format_refresh_stream
 from services.db import init_db, cache_get, cache_set, cache_increment_hit, cache_delete, get_catalogs, get_catalog_items
+from services.catalog_sync import start_background_sync
 
 app = Flask(__name__)
 _cache: TTLCache = TTLCache(ttl_seconds=600)
 
 try:
     init_db()
+    start_background_sync()
 except Exception as e:
     print(f"DB init failed (will retry on first request): {e}")
 

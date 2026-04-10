@@ -156,6 +156,29 @@ def get_catalog_items(catalog_id: str) -> list[str]:
         return []
 
 
+def sync_streaming_catalog(catalog_id: str, name: str, content_type: str, position: int, imdb_ids: list[str]) -> None:
+    """Upsert catalog definition and replace all its items with fresh data from TMDB."""
+    try:
+        with _conn() as conn:
+            conn.execute(
+                """INSERT INTO catalogs (id, name, type, position)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, position = EXCLUDED.position""",
+                (catalog_id, name, content_type, position),
+            )
+            conn.execute("DELETE FROM catalog_items WHERE catalog_id = %s", (catalog_id,))
+            for i, imdb_id in enumerate(imdb_ids):
+                conn.execute(
+                    """INSERT INTO catalog_items (catalog_id, imdb_id, position)
+                       VALUES (%s, %s, %s) ON CONFLICT (catalog_id, imdb_id) DO NOTHING""",
+                    (catalog_id, imdb_id, i),
+                )
+            conn.commit()
+        print(f"DB: synced {len(imdb_ids)} items into catalog '{catalog_id}'")
+    except Exception as e:
+        print(f"DB sync_streaming_catalog error: {e}")
+
+
 def cache_get(video_id: str) -> Optional[dict]:
     """Return cached streams for video_id if within TTL, else None."""
     try:
