@@ -60,13 +60,18 @@ def _sequel_penalty(title: str, name: str, target_num: int | None) -> int:
     return 0
 
 
+def _normalise(s: str) -> str:
+    """Replace common filename separators with spaces for fuzzy title matching."""
+    return re.sub(r'[\s._\-]+', ' ', s).strip()
+
+
 def _score(c: dict, movie: MovieInfo) -> int:
-    name = c["name"].lower()
+    name = _normalise(c["name"].lower())   # separators → spaces for consistent matching
     s = 0
 
     # --- Title match --------------------------------------------------------
-    title_en = (movie.original_title or "").lower().strip()
-    title_cz = (movie.title or "").lower().strip()
+    title_en = _normalise((movie.original_title or "").lower())
+    title_cz = _normalise((movie.title or "").lower())
     target_num_en = _trailing_num(title_en)
     target_num_cz = _trailing_num(title_cz)
 
@@ -88,11 +93,10 @@ def _score(c: dict, movie: MovieInfo) -> int:
     if movie.year and movie.year in name:  s += 8
 
     # --- Czech audio signals ------------------------------------------------
-    if "dabing" in name or " dab " in name or ".dab." in name:  s += 8
-    # CZ label patterns: " cz " / ".cz." / "(cz)" / "-cz-" / filename ends with .cz
-    if re.search(r'(?:^|[\s._(-])cz(?:[\s._)\[]|$)', name):    s += 10
-    elif ".cz" in name:                                          s += 5
-    if "czech" in name:                                          s += 7
+    if "dabing" in name or " dab " in name:                     s += 8
+    # After normalisation, separators become spaces: match " cz " / "cz " at start / " cz" at end
+    if re.search(r'(?:^| )cz(?= |$)', name):                   s += 10
+    if "czech" in name:                                         s += 7
     # Penalise subtitles-only releases
     if "titulky" in name:                                        s -= 10
     if re.search(r'\bsubs?\b', name) and "dabing" not in name:  s -= 5
