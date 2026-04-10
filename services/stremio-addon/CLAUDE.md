@@ -2,20 +2,22 @@
 
 Stremio addon that bridges the MediaSourceFinder API to Stremio's stream protocol.
 For each movie or TV series episode opened in Stremio (identified by IMDB ID), it returns
-up to 5 ranked Czech video streams sourced from Webshare.cz.
+up to 10 ranked Czech video streams sourced from Webshare.cz, with results cached in
+PostgreSQL to avoid repeating expensive searches.
 
 ## Directory Layout
 
 ```
 stremio-addon/
-├── main.py                  # Flask app — manifest, stream handler, redirect
-├── requirements.txt         # flask, httpx, python-dotenv
+├── main.py                  # Flask app — manifest, stream handler, redirect, refresh
+├── requirements.txt         # flask, httpx, python-dotenv, psycopg[binary], gunicorn
 ├── .env                     # Secrets (gitignored)
 ├── .env.example
 ├── services/
-│   ├── cache.py             # In-memory TTL cache (10 min default)
-│   ├── tmdb.py              # IMDB ID -> TMDB movie/TV ID lookup
-│   ├── media_finder.py      # MediaSourceFinder HTTP client
+│   ├── cache.py             # L1 in-memory TTL cache (10 min)
+│   ├── db.py                # L2 PostgreSQL cache — one row per stream
+│   ├── tmdb.py              # IMDB ID -> TMDB movie/TV ID + release year lookup
+│   ├── media_finder.py      # MediaSourceFinder HTTP client (default limit=10)
 │   └── formatter.py         # Format results as Stremio stream objects
 ```
 

@@ -1,8 +1,9 @@
 # MediaSourceFinder — Service Documentation
 
 FastAPI service that accepts a movie ID, fetches metadata from OMDB or TMDB,
-searches Webshare.cz for matching Czech video files, ranks results via AI,
-and returns direct stream URLs with full file metadata.
+searches Webshare.cz for matching Czech video files, ranks results with a
+Python scorer (AI fallback for ambiguous cases), and returns stream URLs with
+full file metadata.
 
 ## Directory Layout
 
@@ -57,7 +58,7 @@ Avoid port 8000 on Windows — it is commonly reserved by the OS.
 | `csfd_id`  | string | one of   | CSFD ID — returns **501** for now                  |
 | `season`   | int    | no       | Season number — required for series with `tmdb_id` |
 | `episode`  | int    | no       | Episode number — required for series with `tmdb_id`|
-| `limit`    | int    | no       | Results to return, default `5`, max `20`           |
+| `limit`    | int    | no       | Results to return, default `10`, max `20`          |
 
 Exactly one of `imdb_id`, `tmdb_id`, `csfd_id` must be provided.
 
@@ -119,7 +120,7 @@ curl "http://localhost:8080/search?tmdb_id=60574&season=2&episode=1&limit=3"  # 
 ## Service Flow
 
 ```
-GET /search?tmdb_id=27205&limit=5
+GET /search?tmdb_id=27205&limit=10
         │
         ▼
 ┌──────────────────────────────────────────────────────┐
@@ -150,19 +151,19 @@ GET /search?tmdb_id=27205&limit=5
   POST /api/search/        POST /api/search/
         │                     │
         └──────────┬──────────┘
-                   │  merge + dedup by ident
+                   │  dedup by ident + by (size, normalised name)
                    │  drop non-video extensions
-                   │  up to 40 candidates
                    ▼
 ┌──────────────────────────────────────────────────────┐
-│ 3. Heuristic pre-filter → top 15                     │
-│    title_en +6, title_cz +4, year +3, CZ +3          │
-│    SxxExx match +10, wrong episode -20, no ep -5     │
+│ 3. Python scorer → top 15 sent to AI if ambiguous    │
+│    (see Python Scorer section below)                 │
+│    score spread < 15 across top N → AI fallback      │
 └──────────────────┬───────────────────────────────────┘
                    │
-                   ▼
-        OpenRouter API (llama-3.1-8b)
-        rank_results() → match_probability 0-100%
+                   ├─ scores spread ≥ 15 → Python result, done (0 ms)
+                   │
+                   └─ scores spread < 15 → OpenRouter gemini-2.0-flash
+                                           re-ranks top 15 candidates
                    │
                    ▼
 ┌──────────────────────────────────────────────────────┐
@@ -186,15 +187,13 @@ GET /search?tmdb_id=27205&limit=5
 4. **Dual parallel search** — two simultaneous `POST /api/search/` calls:
    - Movies: `"{czech_title} {year} CZ"` + `"{original_title} {year} CZ"`
    - Series: `"{show_title_cz} S{s:02d}E{e:02d} CZ"` + `"{show_title_en} S{s:02d}E{e:02d}"`
-5. **Dedup + filter** — deduplicate by `ident`, drop non-video extensions → max 40 candidates
-6. **Pre-filter** (`gemini.py`) — heuristic scoring → top 15:
-   - Movies: title_en(+6), title_cz(+4), year(+3), CZ label(+3), dabing(+2), quality(+1)
-   - Series: adds SxxExx exact match(+10), wrong episode penalty(-20), no-episode-notation(-5)
-7. **AI ranking** (`gemini.py`) — OpenRouter `llama-3.1-8b-instruct` with `json_object` response mode
-   - Returns top N ranked with `match_probability` (0–100) and `reasoning`
-   - Series prompt emphasizes SxxExx as the most critical matching signal
-8. **Parallel fetch** — for top N results only: `POST /api/file_link/` + `POST /api/file_info/` in parallel
-9. **Return** assembled `SearchResponse`
+5. **Dedup + filter** — two layers:
+   - By `ident` (primary)
+   - By `(size, normalised_name[:40])` (secondary) — catches the same file uploaded multiple times under different idents
+   - Drop non-video extensions
+6. **Python scorer + optional AI fallback** (`gemini.py`) — see section below
+7. **Parallel fetch** — for top N results only: `POST /api/file_link/` + `POST /api/file_info/` in parallel
+8. **Return** assembled `SearchResponse`
 
 ## Timing (typical, cached Webshare token)
 
@@ -202,9 +201,11 @@ GET /search?tmdb_id=27205&limit=5
 |------|------|
 | Movie metadata | ~200–900 ms |
 | Webshare search ×2 parallel | ~500–2000 ms |
-| AI ranking (15 candidates) | ~500–4000 ms |
-| file_link + file_info ×N parallel | ~1000–4000 ms |
-| **Total** | **~5–10 s** |
+| Python scorer | ~0–1 ms |
+| AI fallback (only when ambiguous) | ~500–2000 ms |
+| file_link + file_info ×N parallel | ~700–2000 ms |
+| **Total (Python-only)** | **~1.5–3 s** |
+| **Total (with AI fallback)** | **~3–5 s** |
 
 Timing log written to `logs/timing.log` on every request.
 
@@ -219,14 +220,67 @@ wsh = hashlib.sha1(mc.encode()).hexdigest()        # SHA1 of result
 
 Plain `MD5(password+salt)` does NOT work — Webshare requires the full Unix md5crypt algorithm.
 
-## AI Ranking (gemini.py)
+## Python Scorer (gemini.py)
 
-The file is named `gemini.py` for historical reasons but currently uses **OpenRouter**.
+Primary ranking — fast, deterministic, zero API cost.
+All filename matching uses **normalised names** (separators `._-` replaced with spaces)
+so `iron-man-3-2013.mkv` matches title `iron man 3` correctly.
 
-- **Model:** `meta-llama/llama-3.1-8b-instruct` via `https://openrouter.ai/api/v1`
-- **Interface:** `rank_results(movie, candidates, limit) -> list[dict]`
-- To swap provider/model: change `OPENROUTER_BASE` and `MODEL` constants in `gemini.py`
-- Pre-filter heuristic scores: title match (+6/+4), year (+3), CZ label (+3), dubbing (+2), resolution (+1), votes
+### Scoring weights
+
+| Signal | Points |
+|--------|--------|
+| Title EN exact match in filename | +15 |
+| Title CZ exact match in filename | +12 |
+| **No title match at all** | **−30** (filters wrong movies from fuzzy Webshare results) |
+| Sequel number mismatch (Iron Man 2 when looking for Iron Man) | −20 |
+| Year in filename | +8 |
+| Czech audio: `dabing` / `dab` keyword | +8 |
+| Czech audio: ` cz ` label | +10 |
+| Czech audio: `czech` keyword | +7 |
+| Subtitles-only: `titulky` | −10 |
+| Subtitles-only: `subs` (without `dabing`) | −5 |
+| Source: `remux` | +10 |
+| Source: `blu-ray` / `bdrip` | +6 |
+| Source: `web-dl` | +4 |
+| Source: `web-rip` | +2 |
+| Resolution: `2160p` / `4k` / `uhd` | +8 |
+| Resolution: `1080p` | +5 |
+| Resolution: `720p` | +2 |
+| Audio codec: `truehd` / `dts-hd` | +3 |
+| Audio codec: `dts` | +2 |
+| Audio codec: `ac3` / `aac` | +1 |
+| File size ≥ 20 GB | +4 |
+| File size ≥ 10 GB | +3 |
+| File size ≥ 5 GB | +2 |
+| File size ≥ 2 GB | +1 |
+| Positive votes (capped at 3) | +2 each |
+| Negative votes | −3 each |
+| Series SxxExx exact match | +15 |
+| Series wrong SxxExx | −25 |
+| Series no episode notation | −8 |
+
+### AI fallback (gemini-2.0-flash)
+
+Called only when **score spread across top-N < 15** — meaning Python can't confidently
+separate the candidates. Uses `google/gemini-2.0-flash-001` via OpenRouter.
+
+- To change model: update `MODEL` constant in `gemini.py`
+- To change ambiguity threshold: update `AMBIGUITY_THRESHOLD` constant
+- Interface: `rank_results(movie, candidates, limit) -> list[dict]`
+
+### Sequel number detection
+
+Detects when a filename has a different sequel number than the target movie:
+- Target `Iron Man` (no number) + filename `Iron Man 2` → −20 (number > 1)
+- Target `Iron Man 3` + filename `Iron Man 2` → −20 (number mismatch)
+- Target `Iron Man` + filename `Iron Man 1` → no penalty (1 = first film, same movie)
+
+### No-title-match penalty
+
+Webshare's fuzzy search returns phonetically similar titles (e.g. "Ip Man", "Yes Man"
+when searching "Iron Man"). These score high on year + CZ audio alone. The −30 penalty
+for no title match pushes them well below correct results.
 
 ## Webshare file_info Fields
 
