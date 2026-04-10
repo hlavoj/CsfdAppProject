@@ -99,7 +99,7 @@ def stream(content_type: str, video_id: str):
 
     # Store in postgres (only if we got results)
     if streams:
-        cache_set(video_id, streams, movie_year)
+        cache_set(video_id, results, streams, movie_year)
 
     # Always append refresh button
     refresh = format_refresh_stream(video_id, datetime.now(timezone.utc), 0)
