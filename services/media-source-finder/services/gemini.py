@@ -30,6 +30,36 @@ AMBIGUITY_THRESHOLD = 15
 # Python scorer
 # ---------------------------------------------------------------------------
 
+def _trailing_num(title: str) -> int | None:
+    """Extract trailing sequel number from a title, e.g. 'Iron Man 3' → 3, 'Iron Man' → None."""
+    m = re.search(r'\b(\d+)\s*$', title.strip())
+    return int(m.group(1)) if m else None
+
+
+def _sequel_penalty(title: str, name: str, target_num: int | None) -> int:
+    """
+    Return a penalty when the filename has a different sequel number than the target.
+    e.g. searching for 'Iron Man' (no number): 'Iron Man 2.mkv' → -20
+         searching for 'Iron Man 3': 'Iron Man 2.mkv' → -20
+    No penalty when file has '1' and target has no number (same movie, just labeled).
+    """
+    idx = name.find(title)
+    if idx < 0:
+        return 0
+    after = name[idx + len(title):].lstrip(' ._-(')
+    m = re.match(r'^(\d+)', after)
+    if not m:
+        return 0
+    file_num = int(m.group(1))
+    if file_num > 20:          # not a sequel number (could be year, resolution, etc.)
+        return 0
+    if target_num is None and file_num > 1:
+        return -20             # "Iron Man 2" when looking for "Iron Man"
+    if target_num is not None and file_num != target_num:
+        return -20             # "Iron Man 2" when looking for "Iron Man 3"
+    return 0
+
+
 def _score(c: dict, movie: MovieInfo) -> int:
     name = c["name"].lower()
     s = 0
@@ -37,8 +67,22 @@ def _score(c: dict, movie: MovieInfo) -> int:
     # --- Title match --------------------------------------------------------
     title_en = (movie.original_title or "").lower().strip()
     title_cz = (movie.title or "").lower().strip()
-    if title_en and title_en in name:   s += 15
-    if title_cz and title_cz in name:   s += 12
+    target_num_en = _trailing_num(title_en)
+    target_num_cz = _trailing_num(title_cz)
+
+    title_matched = False
+    if title_en and title_en in name:
+        s += 15
+        s += _sequel_penalty(title_en, name, target_num_en)
+        title_matched = True
+    if title_cz and title_cz != title_en and title_cz in name:
+        s += 12
+        s += _sequel_penalty(title_cz, name, target_num_cz)
+        title_matched = True
+
+    # No title match at all → likely a wrong movie returned by fuzzy Webshare search
+    if not title_matched:
+        s -= 30
 
     # --- Year ---------------------------------------------------------------
     if movie.year and movie.year in name:  s += 8

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
@@ -119,12 +120,23 @@ async def search(
     logger.info(f"  2. webshare search x2 parallel                {_ms(t)}  ({len(results_cz)}+{len(results_en)} results)")
 
     # 4. Deduplicate + filter
-    seen: set[str] = set()
+    # Primary dedup: by ident. Secondary: by (size, normalised name prefix) to catch
+    # the same file uploaded multiple times under different idents.
+    seen_idents: set[str] = set()
+    seen_content: set[tuple] = set()
     candidates: list[dict] = []
     for item in results_cz + results_en:
-        if item["ident"] not in seen and _is_video(item):
-            seen.add(item["ident"])
-            candidates.append(item)
+        if item["ident"] in seen_idents or not _is_video(item):
+            continue
+        # Normalise name: strip extension, collapse separators, take first 40 chars
+        norm = re.sub(r'\.\w{2,4}$', '', item["name"]).lower()
+        norm = re.sub(r'[\s._\-]+', ' ', norm)[:40].strip()
+        content_key = (item["size"], norm)
+        if content_key in seen_content:
+            continue
+        seen_idents.add(item["ident"])
+        seen_content.add(content_key)
+        candidates.append(item)
     logger.info(f"  3. dedup+filter                               {len(candidates)} unique candidates")
 
     if not candidates:
