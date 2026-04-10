@@ -11,11 +11,13 @@ PostgreSQL to avoid repeating expensive searches.
 stremio-addon/
 ├── main.py                  # Flask app — manifest, stream handler, redirect, refresh
 ├── requirements.txt         # flask, httpx, python-dotenv, psycopg[binary], gunicorn
+├── Dockerfile               # python:3.12-slim, PYTHONUNBUFFERED=1, single gunicorn worker
 ├── .env                     # Secrets (gitignored)
 ├── .env.example
 ├── services/
 │   ├── cache.py             # L1 in-memory TTL cache (10 min)
-│   ├── db.py                # L2 PostgreSQL cache — one row per stream
+│   ├── db.py                # L2 PostgreSQL cache — one row per stream; catalog DB functions
+│   ├── catalog_sync.py      # Background thread — syncs Disney+/Netflix kids catalogs from TMDB every 7 days
 │   ├── tmdb.py              # IMDB ID -> TMDB movie/TV ID + release year + poster/name lookup
 │   ├── media_finder.py      # MediaSourceFinder HTTP client (default limit=10)
 │   └── formatter.py         # Format results as Stremio stream objects
@@ -270,6 +272,66 @@ The in-memory catalog cache (L1) expires after 10 minutes.
 **Adding a new catalog** requires the user to **reinstall the addon** in Stremio (uninstall →
 paste manifest URL → install) so Stremio picks up the new catalog from the manifest.
 Existing catalog changes (new titles) appear automatically on next catalog refresh.
+
+## Streaming Catalog Sync (catalog_sync.py)
+
+Automatically populates Disney+ and Netflix kids catalogs by querying the TMDB Discover API.
+Runs as a **background daemon thread** started unconditionally at app startup (30s after boot,
+then every 7 days).
+
+### Catalogs synced
+
+| Catalog ID | Name | Type | Position |
+|------------|------|------|----------|
+| `disney_kids_series` | Disney+ Kids Series CZ | series | 2 |
+| `netflix_kids_series` | Netflix Kids Series CZ | series | 3 |
+| `disney_kids_movies` | Disney+ Kids Movies CZ | movie | 4 |
+| `netflix_kids_movies` | Netflix Kids Movies CZ | movie | 5 |
+
+Series are listed before movies (user preference).
+
+### TMDB query parameters
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `with_watch_providers` | 337 (Disney+) / 8 (Netflix) | Provider filter |
+| `watch_region` | `CZ` | Only titles available in Czech Republic |
+| `with_genres` | `16\|10751` | Animation OR Family (`\|` = OR on TMDB) |
+| `sort_by` | `popularity.desc` | Most popular first |
+| pages fetched | 4 × 20 = 80 titles | Per catalog |
+
+### Resolution flow
+
+```
+TMDB Discover (4 pages × 20)
+        │  list of TMDB IDs
+        ▼
+GET /movie|tv/{tmdb_id}/external_ids  ← parallel (10 workers)
+        │  imdb_id: "tt..."
+        ▼
+sync_streaming_catalog()
+        │  DELETE old items + INSERT new (preserves popularity order)
+        ▼
+catalog_items table  →  served by /catalog/{type}/{id}.json
+```
+
+### Why single gunicorn worker
+
+`--workers 1` ensures exactly one background thread runs. With multiple workers,
+each worker process would spawn its own sync thread — redundant TMDB API calls and
+concurrent DB writes (safe but wasteful). Single worker handles the personal-use
+load easily; raise to 2 if concurrency becomes an issue.
+
+`ENV PYTHONUNBUFFERED=1` in Dockerfile ensures sync log lines appear in `docker logs`
+immediately instead of being held in Python's output buffer.
+
+### Tuning constants (catalog_sync.py)
+
+| Constant | Default | Effect |
+|----------|---------|--------|
+| `REFRESH_INTERVAL_SECONDS` | 7 days | How often catalogs refresh |
+| `DISCOVER_PAGES` | 4 (80 titles) | Titles per catalog |
+| `KIDS_GENRES` | `16\|10751` | Animation OR Family |
 
 ## Known Behaviour & Hard-Won Lessons
 
