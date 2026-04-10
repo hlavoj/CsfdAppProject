@@ -9,7 +9,7 @@ from services.cache import TTLCache
 from services.tmdb import get_tmdb_id, get_tmdb_id_and_year, get_tmdb_tv_id
 from services.media_finder import search_streams, get_file_link
 from services.formatter import format_streams, format_refresh_stream
-from services.db import init_db, cache_get, cache_set, cache_increment_hit, cache_delete
+from services.db import init_db, cache_get, cache_set, cache_increment_hit, cache_delete, get_catalogs, get_catalog_items
 
 app = Flask(__name__)
 _cache: TTLCache = TTLCache(ttl_seconds=600)
@@ -18,19 +18,6 @@ try:
     init_db()
 except Exception as e:
     print(f"DB init failed (will retry on first request): {e}")
-
-MANIFEST = {
-    "id": "com.csfdapp.mediasourcefinder",
-    "version": "1.3.0",
-    "name": "MediaSource CZ",
-    "description": "Czech streams from Webshare.cz, AI-ranked",
-    "types": ["movie", "series"],
-    "catalogs": [],
-    "resources": [
-        {"name": "stream", "types": ["movie", "series"], "idPrefixes": ["tt"]}
-    ],
-}
-
 
 @app.after_request
 def cors(response):
@@ -41,7 +28,39 @@ def cors(response):
 
 @app.route("/manifest.json")
 def manifest():
-    return jsonify(MANIFEST)
+    catalogs = get_catalogs()
+    return jsonify({
+        "id": "com.csfdapp.mediasourcefinder",
+        "version": "1.4.0",
+        "name": "MediaSource CZ",
+        "description": "Czech streams from Webshare.cz, AI-ranked",
+        "types": ["movie", "series"],
+        "catalogs": [
+            {"type": c["type"], "id": c["id"], "name": c["name"]}
+            for c in catalogs
+        ],
+        "resources": [
+            {"name": "stream",  "types": ["movie", "series"], "idPrefixes": ["tt"]},
+            {"name": "catalog", "types": ["movie", "series"]},
+        ],
+    })
+
+
+@app.route("/catalog/<content_type>/<path:catalog_id>.json")
+def catalog(content_type: str, catalog_id: str):
+    # Strip trailing .json if path capture included it
+    catalog_id = catalog_id.removesuffix(".json")
+
+    cache_key = f"catalog:{catalog_id}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return jsonify({"metas": cached})
+
+    imdb_ids = get_catalog_items(catalog_id)
+    metas = [{"id": imdb_id, "type": content_type} for imdb_id in imdb_ids]
+
+    _cache.set(cache_key, metas)
+    return jsonify({"metas": metas})
 
 
 def _parse_series_id(video_id: str):
