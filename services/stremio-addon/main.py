@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify, redirect, abort, request, Response
 import requests as req_lib
 from services.cache import TTLCache
-from services.tmdb import get_tmdb_id, get_tmdb_id_and_year, get_tmdb_tv_id
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from services.tmdb import get_tmdb_id, get_tmdb_id_and_year, get_tmdb_tv_id, get_meta
 from services.media_finder import search_streams, get_file_link
 from services.formatter import format_streams, format_refresh_stream
 from services.db import init_db, cache_get, cache_set, cache_increment_hit, cache_delete, get_catalogs, get_catalog_items
@@ -57,7 +58,27 @@ def catalog(content_type: str, catalog_id: str):
         return jsonify({"metas": cached})
 
     imdb_ids = get_catalog_items(catalog_id)
-    metas = [{"id": imdb_id, "type": content_type} for imdb_id in imdb_ids]
+
+    # Fetch name + poster from TMDB in parallel (needed for Stremio to show posters)
+    meta_map: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(get_meta, imdb_id, content_type): imdb_id for imdb_id in imdb_ids}
+        for future in as_completed(futures):
+            imdb_id = futures[future]
+            try:
+                meta_map[imdb_id] = future.result()
+            except Exception:
+                meta_map[imdb_id] = {}
+
+    metas = []
+    for imdb_id in imdb_ids:
+        m = {"id": imdb_id, "type": content_type}
+        extra = meta_map.get(imdb_id, {})
+        if extra.get("name"):
+            m["name"] = extra["name"]
+        if extra.get("poster"):
+            m["poster"] = extra["poster"]
+        metas.append(m)
 
     _cache.set(cache_key, metas)
     return jsonify({"metas": metas})
