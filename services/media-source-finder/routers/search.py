@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import time
 from fastapi import APIRouter, HTTPException, Query
@@ -8,7 +9,8 @@ from typing import Optional
 from models.media_source import SearchResponse, MovieInfo, StreamResult, FileDetail, AudioTrack
 from services.omdb import get_movie_info as omdb_get_movie_info
 from services.tmdb import get_movie_info as tmdb_get_movie_info, get_series_info as tmdb_get_series_info
-from services.webshare import search_videos, get_file_link, get_file_info
+from services.webshare import search_videos as ws_search, get_file_link as ws_file_link, get_file_info
+from services import fastshare
 from services.gemini import rank_results
 
 router = APIRouter()
@@ -108,16 +110,35 @@ async def search(
         cz_query = f"{movie.title} {movie.year} CZ"
         en_query = f"{movie.original_title} {movie.year} CZ"
 
-    # 3. Two parallel Webshare searches
+    # 3. Search — FastShare first, Webshare fallback
+    fs_enabled = bool(os.getenv("FASTSHARE_USERNAME") and os.getenv("FASTSHARE_PASSWORD"))
+    source = "webshare"
     t = time.perf_counter()
-    try:
-        results_cz, results_en = await asyncio.gather(
-            search_videos(cz_query, limit=20),
-            search_videos(en_query, limit=20),
-        )
-    except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=f"Webshare search failed: {e}")
-    logger.info(f"  2. webshare search x2 parallel                {_ms(t)}  ({len(results_cz)}+{len(results_en)} results)")
+
+    raw_results: list[dict] = []
+    if fs_enabled:
+        try:
+            fs_cz, fs_en = await asyncio.gather(
+                fastshare.search_videos(cz_query, limit=20),
+                fastshare.search_videos(en_query, limit=20),
+            )
+            raw_results = fs_cz + fs_en
+            source = "fastshare"
+            logger.info(f"  2. fastshare search x2 parallel              {_ms(t)}  ({len(fs_cz)}+{len(fs_en)} results)")
+        except Exception as e:
+            logger.info(f"  2. fastshare search FAILED ({e}), falling back to webshare")
+
+    if not raw_results:
+        try:
+            ws_cz, ws_en = await asyncio.gather(
+                ws_search(cz_query, limit=20),
+                ws_search(en_query, limit=20),
+            )
+            raw_results = ws_cz + ws_en
+            source = "webshare"
+            logger.info(f"  2. webshare search x2 parallel               {_ms(t)}  ({len(ws_cz)}+{len(ws_en)} results)")
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=f"Webshare search failed: {e}")
 
     # 4. Deduplicate + filter
     # Primary dedup: by ident. Secondary: by (size, normalised name prefix) to catch
@@ -125,7 +146,7 @@ async def search(
     seen_idents: set[str] = set()
     seen_content: set[tuple] = set()
     candidates: list[dict] = []
-    for item in results_cz + results_en:
+    for item in raw_results:
         if item["ident"] in seen_idents or not _is_video(item):
             continue
         # Normalise name: strip extension, collapse separators, take first 40 chars
@@ -137,7 +158,7 @@ async def search(
         seen_idents.add(item["ident"])
         seen_content.add(content_key)
         candidates.append(item)
-    logger.info(f"  3. dedup+filter                               {len(candidates)} unique candidates")
+    logger.info(f"  3. dedup+filter [{source}]                    {len(candidates)} unique candidates")
 
     if not candidates:
         logger.info(f"  TOTAL                                         {_ms(t_total)}  (0 results)")
@@ -153,11 +174,17 @@ async def search(
     sent = min(len(candidates), AI_CANDIDATE_LIMIT)
     logger.info(f"  4. ranking (python+ai fallback, {len(candidates)}→{sent}→{limit})   {_ms(t)}")
 
-    # 6. Parallel file_link + file_info for top N
+    # 6. Parallel file_link + file_info for top N (Webshare only; FastShare idents are self-contained)
     t = time.perf_counter()
     candidate_map = {c["ident"]: c for c in candidates}
-    details = await asyncio.gather(*[_safe_file_details(r["ident"]) for r in ranked])
-    logger.info(f"  5. file_link + file_info x{len(ranked)} parallel          {_ms(t)}")
+
+    if source == "fastshare":
+        # FastShare: URL already in candidate, partial file_detail from search response
+        details = [(c["url"], None) for c in [candidate_map[r["ident"]] for r in ranked]]
+        logger.info(f"  5. fastshare — no file_link/file_info calls needed  {_ms(t)}")
+    else:
+        details = await asyncio.gather(*[_safe_file_details(r["ident"]) for r in ranked])
+        logger.info(f"  5. file_link + file_info x{len(ranked)} parallel          {_ms(t)}")
 
     # 7. Assemble
     results: list[StreamResult] = []
@@ -165,6 +192,14 @@ async def search(
         if url is None:
             continue
         base = candidate_map[ai_result["ident"]]
+        # FastShare: build partial FileDetail from resolution/duration parsed at search time
+        if source == "fastshare" and info is None:
+            info = {}
+            if base.get("_width"):
+                info["width"] = base["_width"]
+                info["height"] = base["_height"]
+            if base.get("_duration"):
+                info["duration_seconds"] = base["_duration"]
         results.append(StreamResult(
             ident=ai_result["ident"],
             name=base["name"],
@@ -185,7 +220,14 @@ async def search(
 @router.get("/file-link/{ident}")
 async def file_link_endpoint(ident: str):
     try:
-        url = await get_file_link(ident)
+        if ident.startswith("fs_"):
+            url = await fastshare.get_file_link(ident)
+        else:
+            url = await ws_file_link(ident)
+        if not url:
+            raise HTTPException(status_code=404, detail="File not found")
         return {"url": url}
-    except RuntimeError as e:
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
