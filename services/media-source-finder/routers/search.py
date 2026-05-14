@@ -53,7 +53,7 @@ def _is_video(item: dict) -> bool:
 
 async def _safe_file_details(ident: str) -> tuple[Optional[str], Optional[dict]]:
     url_result, info_result = await asyncio.gather(
-        get_file_link(ident),
+        ws_file_link(ident),
         get_file_info(ident),
         return_exceptions=True,
     )
