@@ -18,6 +18,8 @@ services:
     build: ./services/media-source-finder
     restart: unless-stopped
     environment:
+      - FASTSHARE_USERNAME=${FASTSHARE_USERNAME}
+      - FASTSHARE_PASSWORD=${FASTSHARE_PASSWORD}
       - WEBSHARE_USERNAME=${WEBSHARE_USERNAME}
       - WEBSHARE_PASSWORD=${WEBSHARE_PASSWORD}
       - OMDB_API_KEY=${OMDB_API_KEY}
